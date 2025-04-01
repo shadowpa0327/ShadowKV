@@ -15,7 +15,7 @@
 #
 ################################################################################
 
-from .glm import GLM
+#from .glm import GLM
 from .llama import Llama
 from .qwen import Qwen2
 from .phi3 import Phi3

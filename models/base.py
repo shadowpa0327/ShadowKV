@@ -26,7 +26,7 @@ from tqdm import tqdm
 from flash_attn import flash_attn_with_kvcache
 
 from .tensor_op import sample_token, layer_norm, minference_prefill_kernel
-from .kv_cache import KV_Cache, ShadowKVCache, ShadowKVCache_CPU
+from .kv_cache import KV_Cache, ShadowKVCache, ShadowKVCache_CPU, xKVCache
 
 class LLM:
 
@@ -34,13 +34,22 @@ class LLM:
         gpu_mem = f"{round(torch.cuda.memory_allocated(self.device) / 1024**3, 2)} GB / {round(torch.cuda.get_device_properties(self.device).total_memory / 1024**3, 2)} GB"
         return f"LLM: {self.model_name}, attn_mode: {self.attn_mode}, max_length: {self.max_length}, batch_size: {self.batch_size}, device: {self.device}, dtype: {self.dtype}, GPU mem: {gpu_mem}"
 
-    def init_kv_cache(self, sparse_budget: int, rank: int, chunk_size: int, config):
+    def init_kv_cache(self, sparse_budget: int, rank: int, chunk_size: int, config, mergr_config=None):
         if self.attn_mode == 'full':
             self.kv_cache = KV_Cache(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size)
         elif self.attn_mode.lower() == 'shadowkv':
             self.kv_cache = ShadowKVCache(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size, sparse_budget=sparse_budget, rank=rank, chunk_size=chunk_size)
         elif self.attn_mode.lower() == 'shadowkv_cpu':
             self.kv_cache = ShadowKVCache_CPU(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size, sparse_budget=sparse_budget, rank=rank, chunk_size=chunk_size)
+        elif self.attn_mode.lower() == 'xkv':
+            self.kv_cache = xKVCache(
+                                config,
+                                merge_config=mergr_config,
+                                batch_size=self.batch_size,
+                                max_length=self.max_length,
+                                device=self.device,
+                                dtype=self.dtype,
+                            )
         else:
             raise ValueError(f"Invalid attention mode {self.attn_mode}")
 
@@ -163,6 +172,29 @@ class LLM:
                 # flash attention
                 hidden_states = flash_attn_with_kvcache(q=query_states.transpose(1, 2), k_cache=key_states.transpose(1, 2), v_cache=value_states.transpose(1, 2), causal=True)
 
+        elif isinstance(self.kv_cache, xKVCache):
+            if q_len > 4*1024: # prefill
+                self.kv_cache.prefill_kv_cache(key_states, value_states, layer_idx)
+                query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, position_ids)
+                                
+                if self.minference == True:
+                    hidden_states = minference_prefill_kernel(query_states=query_states, key_states=key_states, value_states=value_states, minference_parttern=self.minference_parttern[layer_idx])
+                else:
+                    hidden_states = flash_attn_with_kvcache(q=query_states.transpose(1, 2), k_cache=key_states.transpose(1, 2), v_cache=value_states.transpose(1, 2), causal=True)
+            else:
+                query_states = self.apply_rotary_pos_emb_single(query_states, position_ids)
+                
+                # update kv cache to buffer
+                self.kv_cache.update_kv_cache(key_states, value_states, layer_idx)
+                
+                # get key and value
+                position_ids = torch.arange(self.kv_cache.get_kv_len()).unsqueeze(0).repeat(query_states.size(0), 1)
+                key_states = self.kv_cache.get_key_cache(layer_idx, self.apply_rotary_pos_emb_single)
+                value_states = self.kv_cache.get_value_cache(layer_idx)
+                
+                # rope query and key                
+                hidden_states = flash_attn_with_kvcache(q=query_states.transpose(1, 2), k_cache=key_states.transpose(1, 2), v_cache=value_states.transpose(1, 2), causal=True)
+                
         else:
             raise ValueError(f"Invalid attention mode {self.attn_mode}")
 

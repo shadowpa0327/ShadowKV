@@ -67,7 +67,7 @@ def parse_args() -> Namespace:
     def str_to_list(arg):
         return arg.split(',')
     p = ArgumentParser()
-    p.add_argument("--model_name", type=str, default="gradientai/Llama-3-8B-Instruct-Gradient-1048k")
+    p.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct")
     p.add_argument("--dataset_name", type=str_to_list, default=["ruler/niah_single_1"])
     p.add_argument("--num_samples", type=int, default=-1)
     p.add_argument("--batch_size", type=int, default=1)

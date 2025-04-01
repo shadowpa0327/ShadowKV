@@ -31,6 +31,7 @@ from minference.configs.model2path import MODEL2PATH
 from .tensor_op import layer_norm, apply_rotary_pos_emb, apply_rotary_pos_emb_single, apply_rotary_pos_emb_cuda
 from .prompt_template import Templates, Chat_Templates, Prefix_Templates
 from .base import LLM
+from .merge_configs import generate_consecutive_palu_config
 
 class LlamaLayer:
     def __init__(self, layer_idx) -> None:
@@ -82,10 +83,19 @@ class Llama(LLM):
         device :str = 'cuda:0',
         dtype = torch.bfloat16,
         attn_mode: str = 'full',
+        # for ShadowKV
         sparse_budget: int = 2048,
         rank=160,
         chunk_size=8,
-        minference=False) -> None:
+        # for minference
+        minference=False,
+        # for xKV
+        start_layer_idx=0,
+        end_layer_idx=-1,
+        group_size=2,
+        rank_k=512,
+        rank_v=768,
+    ) -> None:
         
         # assert batch_size == 1, "Batch size must be 1"
         self.batch_size = batch_size
@@ -107,7 +117,15 @@ class Llama(LLM):
         self.init_parameters()
         self.attn_mode = attn_mode
         self.minference = minference
-
+        
+        self.merge_config = generate_consecutive_palu_config(
+            start_layer=start_layer_idx,
+            end_layer=end_layer_idx if end_layer_idx != -1 else self.num_layers,
+            group_size=group_size,
+            rank_k=rank_k,
+            rank_v=rank_v
+        )
+        
         if 'llama-3' in model_name.lower():
             self.ctx_template = Templates['llama-3']
             self.chat_template = Chat_Templates['llama-3']
@@ -119,7 +137,7 @@ class Llama(LLM):
         else:
             raise ValueError(f"Invalid model name {model_name}")
 
-        self.init_kv_cache(sparse_budget, rank, chunk_size, self.config)
+        self.init_kv_cache(sparse_budget, rank, chunk_size, self.config, self.merge_config)
 
         if self.minference:
             import json
