@@ -143,6 +143,7 @@ class xKVCache:
         self.kv_offset = 0
         self.prefill = 0
         self.gen_offset = 0
+        self.prompt_len = 0 # Store the prompt length
         
         # batch prefill record
         self.prefilled_batch = 0
@@ -195,25 +196,38 @@ class xKVCache:
             return layer_idx == last_layer_idx_in_group
         return False
     
-    
+    @torch.no_grad()
     def prefill_kv_cache(self,
             new_k_cache_pre_roped: torch.Tensor,
             new_v_cache :torch.Tensor,
             layer_idx :int,
         ):
+        # check whether new_cache_pre_roped and new_v_cache is 4d
+        assert new_k_cache_pre_roped.dim() == 3, "new_k_cache_pre_roped should be 3d"
+        assert new_v_cache.dim() == 3, "new_v_cache should be 3d"
         
-        incoming = new_v_cache.shape[-2] # [bsz, incoming, num_kv_heads*head_dim] 
+        # NOTE(brian1009): We assume that K, and V here are both of shape [bsz, incoming, num_kv_heads, head_dim]
+        
+        incoming = new_v_cache.shape[-2] # [bsz, num_kv_heads, incoming, head_dim] 
         self.prefill = incoming
+
+
+        self.k_prefill_buffer.append(new_k_cache_pre_roped.detach().clone())
+        self.v_prefill_buffer.append(new_v_cache.detach().clone())
         
-        self.k_buffer.append(new_k_cache_pre_roped)
-        self.v_buffer.append(new_v_cache)
-        
+        # print the tensor size of the buffer
+        # NOTE(BRIAN1009): debugging
         if self._should_merge(layer_idx):
             self.cross_layer_svd(layer_idx)
-        
+            # clean the buffer
+            self.k_prefill_buffer.clear()
+            self.v_prefill_buffer.clear()
         if layer_idx == self.num_layers - 1:
             self.kv_offset += incoming
-                
+            if self.prompt_len == 0:  # Only set prompt_len once during initial prefill
+                self.prompt_len = self.kv_offset
+
+    
     @torch.no_grad()
     def cross_layer_svd(self, last_layer_idx):
         """Perform fake SVD on grouped layers, inferring dimensions from the tensors."""
@@ -221,18 +235,16 @@ class xKVCache:
         if group_info is None:
             return  # No valid group found
         start_layer_idx, end_layer_idx = group_info.layers[0], group_info.layers[-1]       
-        
-        assert len(self.k_buffer) == len(self.v_buffer) == len(group_info.layers)
-        
+        assert len(self.v_prefill_buffer) == len(group_info.layers)
         # Step 2: Concatenate along the sequence length dimension
-        combined_key = torch.cat(self.k_buffer, dim=-1)  # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
-        combined_value = torch.cat(self.v_buffer, dim=-1) # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
+        combined_key = torch.cat(self.k_prefill_buffer, dim=-1)  # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
+        combined_value = torch.cat(self.v_prefill_buffer, dim=-1) # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
 
         # Step 3: Apply fake SVD (truncate and multiply back)
         Ak, Bk = self._svd(combined_key, rank=group_info.rank_k)
         Av, Bv = self._svd(combined_value, rank=group_info.rank_v)
         
-        split_sizes = [self.num_heads*self.head_dim for _ in range(start_layer_idx, end_layer_idx + 1)]
+        split_sizes = [self.num_key_value_heads*self.head_dim for _ in range(start_layer_idx, end_layer_idx + 1)]
         Bks = torch.split(Bk, split_sizes, dim=-1)
         Bvs = torch.split(Bv, split_sizes, dim=-1)
         
@@ -248,13 +260,18 @@ class xKVCache:
         torch.cuda.synchronize()
     
     def _svd(self, tensor, rank):
+        original_dtype = tensor.dtype
         bs, seq_len, hidden_dim = tensor.shape
-        U, S, V_h = torch.linalg.svd(tensor, full_matrices=False)
+        U, S, V_h = torch.linalg.svd(tensor.float(), full_matrices=False)
         U_trunc = U[:, :, :rank]
         S_trunc = S[:, :rank]
         V_h_trunc = V_h[:, :rank, :]
         
-        return torch.matmul(U_trunc, torch.diag_embed(S_trunc)), V_h_trunc
+        A = torch.matmul(U_trunc, torch.diag_embed(S_trunc)).to(original_dtype)
+        B = V_h_trunc.to(original_dtype)
+        
+        return A, B
+        
     
     def _get_basis_and_reconst_matrix(self, layer_idx, target='key'):
         group_info = self.merge_setup.get_group_for_layer(layer_idx)
@@ -267,6 +284,7 @@ class xKVCache:
         else:
             raise ValueError(f"Invalid target: {target}")
     
+    @torch.no_grad()
     def get_value_cache(self, layer_idx):
         """
         Reconstruct the entire value cache for `layer_idx` up to the current decode position
@@ -276,7 +294,7 @@ class xKVCache:
         We store them directly into self.v_inference_buffer (in two slices)
         and return the relevant portion of that buffer.
         """
-        # 1) Get A, B for the group that this layer belongs to
+        # # # 1) Get A, B for the group that this layer belongs to
         A, B = self._get_basis_and_reconst_matrix(layer_idx, target='value')
         # A shape => (bs, old_seq_len, rank)
         # B shape => (bs, rank, hidden_dim)
@@ -287,89 +305,77 @@ class xKVCache:
         heads = self.num_key_value_heads
         head_dim = hidden_dim // heads
 
-        # 2) Reshape the old portion to (bs, old_seq_len, heads, head_dim)
-        V_old_4d = V_old.view(bs, old_seq_len, heads, head_dim)
+        # # 2) Reshape the old portion to (bs, old_seq_len, heads, head_dim)
+        V_old_t = V_old.view(bs, old_seq_len, heads, head_dim).transpose(1, 2)
 
-        # 3) Get the new portion from self.v_new_generated
-        # shape => (bs, num_key_value_heads, gen_offset, head_dim)
-        V_new = self.v_new_generated[layer_idx, :, :, :self.gen_offset, :]
-        new_seq_len = self.gen_offset
+        #V_old_t = self.v_prefill_buffer[layer_idx]
+        bs, heads, old_seq_len, head_dim = V_old_t.shape
 
-        # 4) We'll write both old and new into v_inference_buffer WITHOUT doing a cat.
-        #    Our v_inference_buffer is shaped (bs, heads, max_length, head_dim).
-        #    We want to store old portion in [0 : old_seq_len], new in [old_seq_len : old_seq_len + new_seq_len].
+        # # 3) Get the new portion from self.v_new_generated
+        # # shape => (bs, num_key_value_heads, gen_offset, head_dim)
+        gen_offset = self.gen_offset + 1 if layer_idx != self.num_layers - 1 else self.gen_offset
+        V_new = self.v_new_generated[layer_idx, :, :, :gen_offset, :]
+        new_seq_len = gen_offset
 
-        # (a) Permute old to match (bs, heads, seq_len, head_dim)
-        V_old_t = V_old_4d.permute(0, 2, 1, 3)  # => (bs, heads, old_seq_len, head_dim)
-
-        # (b) Permute new => (bs, heads, new_seq_len, head_dim)
-        V_new_t = V_new.permute(0, 2, 1, 3)    # => (bs, heads, new_seq_len, head_dim)
-
-        # (c) Copy old portion directly
+        # (b) Copy old portion directly
         self.v_inference_buffer[:, :, :old_seq_len, :].copy_(V_old_t)
 
-        # (d) Copy new portion
-        self.v_inference_buffer[:, :, old_seq_len : (old_seq_len + new_seq_len), :].copy_(V_new_t)
+        # (c) Copy new portion
+        self.v_inference_buffer[:, :, old_seq_len : (old_seq_len + new_seq_len), :].copy_(V_new)
 
         total_seq_len = old_seq_len + new_seq_len
 
         # 5) Return the slice that covers the entire sequence so far
         return self.v_inference_buffer[:, :, :total_seq_len, :]
 
-    
+    @torch.no_grad()
     def get_key_cache(self, layer_idx, position_ids, rope_func):
         """
-        Similar approach, but we also apply rotary embeddings to the entire sequence
-        after we've copied the old+new parts into the k_inference_buffer.
+        Similar approach, but we apply rotary embeddings only to the reconstructed portion.
+        The newly generated tokens already have RoPE applied.
         """
-        # 1) Reconstruct from A,B
+        ## 1) Get KV-Cache from buffer
         A, B = self._get_basis_and_reconst_matrix(layer_idx, target='key')
-        K_old = torch.einsum('bsr,brd->bsd', A, B)  # (bs, old_seq_len, hidden_dim)
-
+        K_old = torch.einsum('bsr,brd->bsd', A, B)
         bs, old_seq_len, hidden_dim = K_old.shape
         heads = self.num_key_value_heads
         head_dim = hidden_dim // heads
+        K_old_t = K_old.view(bs, old_seq_len, heads, head_dim).transpose(1, 2)
+    
+        # 3) Apply RoPE to the reconstructed portion and permute to match buffer format
+        K_old_t = rope_func(K_old_t, position_ids)  # Apply RoPE here
+        
+        # 4) Grab newly generated portion (already has RoPE applied)
+        gen_offset = self.gen_offset + 1 if layer_idx != self.num_layers - 1 else self.gen_offset
+        K_new = self.k_new_generated[layer_idx, :, :, :gen_offset, :] # (bs, num_kv_heads, gen_offset, head_dim)
+        new_seq_len = gen_offset
 
-        # 2) Reshape
-        K_old_4d = K_old.view(bs, old_seq_len, heads, head_dim)
+        # 5) We'll write both old and new into k_inference_buffer WITHOUT doing a cat.
+        #    Our k_inference_buffer is shaped (bs, heads, max_length, head_dim).
+        #    We want to store old portion in [0 : old_seq_len], new in [old_seq_len : old_seq_len + new_seq_len].
 
-        # 3) Grab newly generated portion
-        K_new = self.k_new_generated[layer_idx, :, :, :self.gen_offset, :] 
-        new_seq_len = self.gen_offset
-
-        # 4) Write them into k_inference_buffer (bs, heads, max_length, head_dim)
-        K_old_t = K_old_4d.permute(0, 2, 1, 3)  # => (bs, heads, old_seq_len, head_dim)
-        K_new_t = K_new.permute(0, 2, 1, 3)    # => (bs, heads, new_seq_len, head_dim)
-
+        # (a) Copy old portion directly (already in the right format after RoPE and transpose)
         self.k_inference_buffer[:, :, :old_seq_len, :].copy_(K_old_t)
-        self.k_inference_buffer[:, :, old_seq_len:old_seq_len+new_seq_len, :].copy_(K_new_t)
+
+        # (b) Copy new portion (already has RoPE)
+        self.k_inference_buffer[:, :, old_seq_len : (old_seq_len + new_seq_len), :].copy_(K_new)
 
         total_seq_len = old_seq_len + new_seq_len
-
-        # 5) Now apply rotary on the entire range in place, if desired:
-        #    your rope_func might expect shape (bs, seq_len, heads, head_dim), etc.
-        #    So let's permute to (bs, total_seq_len, heads, head_dim), apply rope, and permute back.
-        K_for_rope = self.k_inference_buffer[:, :, :total_seq_len, :].permute(0, 2, 1, 3)  # => (bs, total_seq_len, heads, head_dim)
-
-        # Apply your rope_func
-        K_rope = rope_func(K_for_rope, position_ids)  # same shape
-
-        # Store back in the k_inference_buffer
-        self.k_inference_buffer[:, :, :total_seq_len, :] = K_rope.permute(0, 2, 1, 3)
-
         # 6) Return final slice
         return self.k_inference_buffer[:, :, :total_seq_len, :]
 
     def update_kv_cache(self,
-            new_k_cache :torch.Tensor,
+            new_k_roped_cache :torch.Tensor,
             new_v_cache :torch.Tensor,
             layer_idx :int,
         ):
-        incoming = new_k_cache.shape[-2]
+        # note that new_k_roped_cache and new_v_cache are 4d tensors
+        assert new_k_roped_cache.dim() == 4, "new_k_roped_cache should be 4d"
+        assert new_v_cache.dim() == 4, "new_v_cache should be 4d"
+        incoming = new_k_roped_cache.shape[-2]
         assert incoming ==  1, "Only update 1 tokens at a time at xKVCache"
-        
-        self.k_new_generated[layer_idx][:, :, :, self.gen_offset:self.gen_offset + incoming].copy_(new_k_cache)
-        self.v_new_generated[layer_idx][:, :, :, self.gen_offset:self.gen_offset + incoming].copy_(new_v_cache)
+        self.k_new_generated[layer_idx][:, :, self.gen_offset:self.gen_offset + incoming].copy_(new_k_roped_cache)
+        self.v_new_generated[layer_idx][:, :, self.gen_offset:self.gen_offset + incoming].copy_(new_v_cache)
         
         if layer_idx == self.num_layers - 1:
             self.kv_offset += incoming
@@ -379,16 +385,21 @@ class xKVCache:
     def clear(self):
         self.kv_offset = 0
         self.prefilled_batch = 0
+        self.prompt_len = 0  # Reset prompt length
+        self.gen_offset = 0
         self.Ak = []
         self.Av = []
         self.Bk = []
         self.Bv = []
-        self.k_buffer = []
-        self.v_buffer = []
+        self.k_prefill_buffer = []
+        self.v_prefill_buffer = []
         self.k_new_generated.zero_()
         self.v_new_generated.zero_()
         self.k_inference_buffer.zero_()
         self.v_inference_buffer.zero_()
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
     
     def H2D(self):
         pass
@@ -396,8 +407,11 @@ class xKVCache:
     def get_kv_len(self):
         return self.kv_offset
 
+    def get_prompt_len(self):
+        return self.prompt_len
+
     def print_stats(self):
-        print(f"xKVCache")
+        print(f"xKVCache | prompt_len: {self.prompt_len} | current_len: {self.kv_offset}")
 
 class ShadowKVCache:
     """ShadowKV, only for accuracy measurement and understanding, not for efficiency, please refer to ShadowKV_CPU for the efficient implementation"""

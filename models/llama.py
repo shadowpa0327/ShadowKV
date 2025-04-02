@@ -157,6 +157,10 @@ class Llama(LLM):
         return apply_rotary_pos_emb_cuda(x, self.cos_sin_cache, position_ids)
 
     @torch.inference_mode()
+    def apply_rotary_pos_emb_single_torch(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        return apply_rotary_pos_emb_single(x, self.cos_cache, self.sin_cache, position_ids)
+
+    @torch.inference_mode()
     def apply_rotary_pos_emb(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         vllm._custom_ops.rotary_embedding(position_ids, q, k, 128, self.cos_sin_cache, True)
         bsz = q.shape[0]
@@ -176,7 +180,7 @@ class Llama(LLM):
         except:
             cos_cache, sin_cache = self._set_cos_sin_cache(hf_model.model.layers[0].self_attn.rotary_emb.inv_freq.to(self.device))
         self.cos_sin_cache = torch.cat((cos_cache[:, :64], sin_cache[:, :64]), dim=-1)
-        
+        self.cos_cache, self.sin_cache = cos_cache, sin_cache
         del cos_cache, sin_cache
 
         self.layers :list[LlamaLayer] = []
@@ -191,6 +195,7 @@ class Llama(LLM):
 
         self.num_layers = len(self.layers)
 
+    @torch.inference_mode()
     def pre_attention_compute(
         self,
         hidden_states: torch.Tensor,
@@ -202,9 +207,13 @@ class Llama(LLM):
         hidden_states = layer_norm(hidden_states, buffer.input_layernorm_variance_epsilon, buffer.input_layernorm_weight)
         qkv = F.linear(hidden_states, buffer.wqkv)
         query_states, key_states, value_states = qkv.split([buffer.q_size, buffer.kv_size, buffer.kv_size], dim=-1)
-
+        del qkv
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
         return query_states, key_states, value_states.view(value_states.shape[0], -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+    @torch.inference_mode()
     def post_attention_compute(
         self,
         attn_output: torch.Tensor,

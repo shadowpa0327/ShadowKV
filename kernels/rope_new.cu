@@ -22,6 +22,7 @@
 #include <cuda_bf16.h>
 #include <vector>
 #include "functions.h"
+#include <stdio.h>
 
 __global__ void apply_rotary_pos_emb_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -34,11 +35,16 @@ __global__ void apply_rotary_pos_emb_kernel(
     int stride_pid_b, int stride_pid_h, int stride_pid_s,
     int half_dim)
 {
+    
     int b_idx = blockIdx.x;
     int h_idx = blockIdx.y;
     int s_idx = blockIdx.z;
     int tid = threadIdx.x;
 
+    if (b_idx >= batch_size || h_idx >= heads || s_idx >= seq_len || tid >= half_dim) {
+        printf("Out of bounds: b_idx: %d, h_idx: %d, s_idx: %d, tid: %d, half_dim: %d\n", b_idx, h_idx, s_idx, tid, half_dim);
+        return; // skip out-of-bounds
+    }
     int pid = position_ids[b_idx * stride_pid_b + h_idx * stride_pid_h + s_idx * stride_pid_s];
     const __nv_bfloat16* cos_sin_ptr = cos_sin + pid * stride_cos_sin;
 
@@ -81,6 +87,18 @@ void apply_rotary_pos_emb_new(
         stride_pid_b, stride_pid_h, stride_pid_s,
         half_dim
     );
+
+
+    cudaError_t err = cudaPeekAtLastError(); // catches any launch configuration error
+    if (err != cudaSuccess) {
+        printf("Launch error: %s\n", cudaGetErrorString(err));
+    }
+
+    cudaDeviceSynchronize(); // Forces the kernel to complete now
+    err = cudaGetLastError(); // Catches runtime errors (like illegal memory access)
+    if (err != cudaSuccess) {
+        printf("Kernel runtime error: %s\n", cudaGetErrorString(err));
+    }
 }
 
 __global__ void apply_rotary_pos_emb_kernel_v2(

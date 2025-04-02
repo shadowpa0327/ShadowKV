@@ -49,7 +49,8 @@ class LayerGroup:
         if not self.layers:
             raise ValueError("LayerGroup must have at least one layer index.")
 
-
+    group_id: Optional[int] = -1
+    
 @dataclass
 class PaluConfig:
     """
@@ -122,7 +123,10 @@ class PaluConfig:
         # 3) If num_layers is set, validate no group references a layer_idx >= num_layers
         if self.num_layers is not None:
             self._validate_num_layers()
-    
+
+        # 4) Assign group_id to each group
+        for idx, grp in enumerate(self.layer_groups):
+            grp.group_id = idx
     def _validate_num_layers(self):
         """
         Ensure that for every layer in every group, layer_idx < num_layers.

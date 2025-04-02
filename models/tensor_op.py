@@ -152,9 +152,11 @@ def apply_rotary_pos_emb_single(q, cos, sin, position_ids, unsqueeze_dim=1):
 def apply_rotary_pos_emb_cuda(x, cos_sin, position_ids):
     batch_size, heads, seq_len, embed_dim = x.shape
     half_dim = embed_dim // 2
-    
-    output = torch.empty_like(x)
 
+    #NOTE(brian1009): If position_ids is 2D [batch_size, seq_len], expand it to 3D [batch_size, heads, seq_len]
+    if position_ids.dim() == 2:
+        position_ids = position_ids.unsqueeze(1).expand(-1, heads, -1).contiguous()
+    output = torch.empty_like(x)
     shadowkv.apply_rotary_pos_emb_new(
         x, cos_sin, position_ids, output,
         int(batch_size), int(heads), int(seq_len), int(embed_dim),
