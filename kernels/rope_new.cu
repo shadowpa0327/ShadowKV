@@ -46,6 +46,10 @@ __global__ void apply_rotary_pos_emb_kernel(
         return; // skip out-of-bounds
     }
     int pid = position_ids[b_idx * stride_pid_b + h_idx * stride_pid_h + s_idx * stride_pid_s];
+    if (pid < 0) {
+        printf("Out of bounds: b_idx: %d, h_idx: %d, s_idx: %d, tid: %d, half_dim: %d\n", b_idx, h_idx, s_idx, tid, half_dim);
+        return; // skip out-of-bounds
+    }
     const __nv_bfloat16* cos_sin_ptr = cos_sin + pid * stride_cos_sin;
 
     int x_offset = b_idx * stride_xb + h_idx * stride_xh + s_idx * stride_xs;
@@ -100,6 +104,109 @@ void apply_rotary_pos_emb_new(
         printf("Kernel runtime error: %s\n", cudaGetErrorString(err));
     }
 }
+
+// Templated kernel that uses CHUNK_SIZE as a compile-time constant
+template <int CHUNK_SIZE>
+__global__ void apply_rotary_pos_emb_kernel_chunked(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ cos_sin,
+    const int64_t*       __restrict__ position_ids,
+    __nv_bfloat16*       __restrict__ output,
+    int batch_size, int heads, int seq_len, int embed_dim,
+    int stride_xb, int stride_xh, int stride_xs, int stride_xe,
+    int stride_cos_sin,
+    int stride_pid_b, int stride_pid_h, int stride_pid_s,
+    int half_dim)
+{
+    // Identify which (b, h) chunk we are, plus the chunk of the sequence
+    int b_idx     = blockIdx.x;
+    int h_idx     = blockIdx.y;
+    int chunk_idx = blockIdx.z;
+    int tid       = threadIdx.x;
+
+    // Basic out-of-bounds checks for batch, head, and half-dim
+    if (b_idx >= batch_size || h_idx >= heads || tid >= half_dim) {
+        return;
+    }
+
+    // Figure out the range of sequence positions handled by this block
+    int s_start = chunk_idx * CHUNK_SIZE;
+    int s_end   = min(s_start + CHUNK_SIZE, seq_len);
+
+    // Loop over the sequence positions in this chunk
+    for (int s_idx = s_start; s_idx < s_end; s_idx++) {
+        int pid = position_ids[b_idx * stride_pid_b
+                             + h_idx * stride_pid_h
+                             + s_idx * stride_pid_s];
+        if (pid < 0) {
+            continue;
+        }
+
+        const __nv_bfloat16* cos_sin_ptr = cos_sin + pid * stride_cos_sin;
+
+        int x_offset = b_idx * stride_xb
+                     + h_idx * stride_xh
+                     + s_idx * stride_xs;
+
+        const __nv_bfloat16* x_ptr      = x      + x_offset;
+        __nv_bfloat16*       output_ptr = output + x_offset;
+
+        // Do the rotary embedding math
+        __nv_bfloat16 x1 = x_ptr[tid];
+        __nv_bfloat16 x2 = x_ptr[tid + half_dim];
+        __nv_bfloat16 c  = cos_sin_ptr[tid];
+        __nv_bfloat16 s  = cos_sin_ptr[tid + half_dim];
+
+        output_ptr[tid]            = __hadd(__hmul(x1, c), __hmul(__hneg(x2), s));
+        output_ptr[tid + half_dim] = __hadd(__hmul(x2, c), __hmul(x1,      s));
+    }
+}
+
+//template <int CHUNK_SIZE>
+void apply_rotary_pos_emb_chunked(
+    torch::Tensor x,
+    torch::Tensor cos_sin,
+    torch::Tensor position_ids,
+    torch::Tensor output,
+    int batch_size, int heads, int seq_len, int embed_dim,
+    int stride_xb, int stride_xh, int stride_xs, int stride_xe,
+    int stride_cos_sin,
+    int stride_pid_b, int stride_pid_h, int stride_pid_s,
+    int half_dim)
+{
+    // Compute how many blocks we need in the Z dimension
+    int grid_z = (seq_len + 32 - 1) / 32;
+
+    dim3 blocks(batch_size, heads, grid_z);
+    dim3 threads(half_dim);
+
+    apply_rotary_pos_emb_kernel_chunked<32><<<blocks, threads>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(cos_sin.data_ptr<at::BFloat16>()),
+        position_ids.data_ptr<int64_t>(),
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        batch_size, heads, seq_len, embed_dim,
+        stride_xb, stride_xh, stride_xs, stride_xe,
+        stride_cos_sin,
+        stride_pid_b, stride_pid_h, stride_pid_s,
+        half_dim
+    );
+
+    cudaError_t err = cudaPeekAtLastError(); 
+    if (err != cudaSuccess) {
+        printf("Launch error: %s\n", cudaGetErrorString(err));
+    }
+
+    cudaDeviceSynchronize();
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Kernel runtime error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+
+
+
 
 __global__ void apply_rotary_pos_emb_kernel_v2(
     const __nv_bfloat16* __restrict__ x,

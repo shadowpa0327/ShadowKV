@@ -66,6 +66,14 @@ void apply_rotary_pos_emb_new(
     int stride_pid_b, int stride_pid_h, int stride_pid_s,
     int half_dim);
 
+void apply_rotary_pos_emb_chunked(
+    torch::Tensor x, torch::Tensor cos_sin, torch::Tensor position_ids, torch::Tensor output,
+    int batch_size, int heads, int seq_len, int embed_dim,
+    int stride_xb, int stride_xh, int stride_xs, int stride_xe,
+    int stride_cos_sin,
+    int stride_pid_b, int stride_pid_h, int stride_pid_s,
+    int half_dim);
+
 void apply_rotary_pos_emb_new_v2(
     torch::Tensor x, torch::Tensor cos_sin, torch::Tensor position_ids, torch::Tensor output,
     int batch_size, int heads, int seq_len, int embed_dim,

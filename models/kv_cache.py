@@ -23,6 +23,7 @@ from models.tensor_op import batch_gather_gemm_rotary_pos_emb_cuda
 from kernels import shadowkv
 from typing import List
 from .merge_configs import PaluConfig
+from torch.autograd.profiler import record_function
 
 class KV_Cache:
     """Full Attention"""
@@ -208,7 +209,7 @@ class xKVCache:
         
         # NOTE(brian1009): We assume that K, and V here are both of shape [bsz, incoming, num_kv_heads, head_dim]
         
-        incoming = new_v_cache.shape[-2] # [bsz, num_kv_heads, incoming, head_dim] 
+        incoming = new_v_cache.shape[-2] # [bsz, incoming, num_kv_heads*head_dim] 
         self.prefill = incoming
 
 
@@ -230,45 +231,49 @@ class xKVCache:
     
     @torch.no_grad()
     def cross_layer_svd(self, last_layer_idx):
-        """Perform fake SVD on grouped layers, inferring dimensions from the tensors."""
-        group_info = self.merge_setup.get_group_for_layer(last_layer_idx)
-        if group_info is None:
-            return  # No valid group found
-        start_layer_idx, end_layer_idx = group_info.layers[0], group_info.layers[-1]       
-        assert len(self.v_prefill_buffer) == len(group_info.layers)
-        # Step 2: Concatenate along the sequence length dimension
-        combined_key = torch.cat(self.k_prefill_buffer, dim=-1)  # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
-        combined_value = torch.cat(self.v_prefill_buffer, dim=-1) # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
+        with record_function("## Cross-layer SVD ##"):
+            """Perform fake SVD on grouped layers, inferring dimensions from the tensors."""
+            group_info = self.merge_setup.get_group_for_layer(last_layer_idx)
+            if group_info is None:
+                return  # No valid group found
+            start_layer_idx, end_layer_idx = group_info.layers[0], group_info.layers[-1]       
+            assert len(self.v_prefill_buffer) == len(group_info.layers)
+            # Step 2: Concatenate along the sequence length dimension
+            combined_key = torch.cat(self.k_prefill_buffer, dim=-1)  # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
+            combined_value = torch.cat(self.v_prefill_buffer, dim=-1) # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
 
-        # Step 3: Apply fake SVD (truncate and multiply back)
-        Ak, Bk = self._svd(combined_key, rank=group_info.rank_k)
-        Av, Bv = self._svd(combined_value, rank=group_info.rank_v)
-        
-        split_sizes = [self.num_key_value_heads*self.head_dim for _ in range(start_layer_idx, end_layer_idx + 1)]
-        Bks = torch.split(Bk, split_sizes, dim=-1)
-        Bvs = torch.split(Bv, split_sizes, dim=-1)
-        
-        # Cache shared latents and layer-specific reconstruction matrices
-        self.Bk.extend(Bks)
-        self.Bv.extend(Bvs)
-        self.Ak.append(Ak)
-        self.Av.append(Av)
+            # Step 3: Apply fake SVD (truncate and multiply back)
+            Ak, Bk = self._svd(combined_key, rank=group_info.rank_k)
+            Av, Bv = self._svd(combined_value, rank=group_info.rank_v)
+            
+            split_sizes = [self.num_key_value_heads*self.head_dim for _ in range(start_layer_idx, end_layer_idx + 1)]
+            Bks = torch.split(Bk, split_sizes, dim=-1)
+            Bvs = torch.split(Bv, split_sizes, dim=-1)
+            
+            # Cache shared latents and layer-specific reconstruction matrices
+            self.Bk.extend(Bks)
+            self.Bv.extend(Bvs)
+            self.Ak.append(Ak)
+            self.Av.append(Av)
 
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        # torch.cuda.synchronize()
     
-    def _svd(self, tensor, rank):
+    def _svd(self, tensor, rank, randomized_svd=True):
         original_dtype = tensor.dtype
-        bs, seq_len, hidden_dim = tensor.shape
-        U, S, V_h = torch.linalg.svd(tensor.float(), full_matrices=False)
-        U_trunc = U[:, :, :rank]
-        S_trunc = S[:, :rank]
-        V_h_trunc = V_h[:, :rank, :]
-        
-        A = torch.matmul(U_trunc, torch.diag_embed(S_trunc)).to(original_dtype)
-        B = V_h_trunc.to(original_dtype)
+        if not randomized_svd:
+            U, S, V_h = torch.linalg.svd(tensor.float(), full_matrices=False)
+            U_trunc = U[:, :, :rank]
+            S_trunc = S[:, :rank]
+            V_h_trunc = V_h[:, :rank, :]
+            A = torch.matmul(U_trunc, torch.diag_embed(S_trunc)).to(original_dtype)
+            B = V_h_trunc.to(original_dtype)
+        else:
+            U, S, V = torch.svd_lowrank(tensor.float(), q=rank)
+            A = torch.matmul(U, torch.diag_embed(S)).to(original_dtype)
+            B = V.transpose(-2, -1).to(original_dtype)
         
         return A, B
         
@@ -294,12 +299,13 @@ class xKVCache:
         We store them directly into self.v_inference_buffer (in two slices)
         and return the relevant portion of that buffer.
         """
-        # # # 1) Get A, B for the group that this layer belongs to
-        A, B = self._get_basis_and_reconst_matrix(layer_idx, target='value')
-        # A shape => (bs, old_seq_len, rank)
-        # B shape => (bs, rank, hidden_dim)
-        # We'll do an einsum or matmul to get (bs, old_seq_len, hidden_dim)
-        V_old = torch.einsum('bsr,brd->bsd', A, B)  # shape => (bs, old_seq_len, hidden_dim)
+        with record_function("## Reconstruct Value Cache ##"):
+            # # # 1) Get A, B for the group that this layer belongs to
+            A, B = self._get_basis_and_reconst_matrix(layer_idx, target='value')
+            # A shape => (bs, old_seq_len, rank)
+            # B shape => (bs, rank, hidden_dim)
+            # We'll do an einsum or matmul to get (bs, old_seq_len, hidden_dim)
+            V_old = torch.einsum('bsr,brd->bsd', A, B)  # shape => (bs, old_seq_len, hidden_dim)
 
         bs, old_seq_len, hidden_dim = V_old.shape
         heads = self.num_key_value_heads
@@ -335,15 +341,17 @@ class xKVCache:
         The newly generated tokens already have RoPE applied.
         """
         ## 1) Get KV-Cache from buffer
-        A, B = self._get_basis_and_reconst_matrix(layer_idx, target='key')
-        K_old = torch.einsum('bsr,brd->bsd', A, B)
-        bs, old_seq_len, hidden_dim = K_old.shape
-        heads = self.num_key_value_heads
+        with record_function("## Get Key Cache ##"):
+            A, B = self._get_basis_and_reconst_matrix(layer_idx, target='key')
+            K_old = torch.einsum('bsr,brd->bsd', A, B)
+            bs, old_seq_len, hidden_dim = K_old.shape
+            heads = self.num_key_value_heads
         head_dim = hidden_dim // heads
         K_old_t = K_old.view(bs, old_seq_len, heads, head_dim).transpose(1, 2)
     
         # 3) Apply RoPE to the reconstructed portion and permute to match buffer format
-        K_old_t = rope_func(K_old_t, position_ids)  # Apply RoPE here
+        with record_function("## Re-RoPE Key ##"):
+            K_old_t = rope_func(K_old_t, position_ids)  # Apply RoPE here
         
         # 4) Grab newly generated portion (already has RoPE applied)
         gen_offset = self.gen_offset + 1 if layer_idx != self.num_layers - 1 else self.gen_offset

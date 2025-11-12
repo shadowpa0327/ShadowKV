@@ -28,7 +28,13 @@ transformers.logging.set_verbosity_error()
 import vllm
 from minference.configs.model2path import MODEL2PATH
 
-from .tensor_op import layer_norm, apply_rotary_pos_emb, apply_rotary_pos_emb_single, apply_rotary_pos_emb_cuda
+from .tensor_op import (
+    layer_norm, 
+    apply_rotary_pos_emb, 
+    apply_rotary_pos_emb_single, 
+    apply_rotary_pos_emb_cuda, 
+    apply_rotary_pos_emb_cuda_chunked
+)
 from .prompt_template import Templates, Chat_Templates, Prefix_Templates
 from .base import LLM
 from .merge_configs import generate_consecutive_palu_config
@@ -93,8 +99,8 @@ class Llama(LLM):
         start_layer_idx=0,
         end_layer_idx=-1,
         group_size=2,
-        rank_k=512,
-        rank_v=768,
+        rank_k=256,
+        rank_v=384,
     ) -> None:
         
         # assert batch_size == 1, "Batch size must be 1"
@@ -154,7 +160,7 @@ class Llama(LLM):
 
     @torch.inference_mode()
     def apply_rotary_pos_emb_single(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        return apply_rotary_pos_emb_cuda(x, self.cos_sin_cache, position_ids)
+        return apply_rotary_pos_emb_cuda_chunked(x, self.cos_sin_cache, position_ids)
 
     @torch.inference_mode()
     def apply_rotary_pos_emb_single_torch(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
@@ -207,10 +213,6 @@ class Llama(LLM):
         hidden_states = layer_norm(hidden_states, buffer.input_layernorm_variance_epsilon, buffer.input_layernorm_weight)
         qkv = F.linear(hidden_states, buffer.wqkv)
         query_states, key_states, value_states = qkv.split([buffer.q_size, buffer.kv_size, buffer.kv_size], dim=-1)
-        del qkv
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        gc.collect()
         return query_states, key_states, value_states.view(value_states.shape[0], -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
     @torch.inference_mode()
