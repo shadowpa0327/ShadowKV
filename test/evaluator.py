@@ -89,7 +89,7 @@ class Evaluator:
             
             progress_bar.update(1)
             avg_score = sum(scores) / len(scores)
-            progress_bar.set_postfix({'avg_score': avg_score})
+            progress_bar.set_postfix({'avg_score': avg_score, 'max_mem': torch.cuda.max_memory_allocated(0) / 1024**3})
 
             if dataset.dataset_name == 'niah':
                 preds = {

@@ -21,6 +21,9 @@ import gc
 from torch import nn
 from models.tensor_op import batch_gather_gemm_rotary_pos_emb_cuda
 from kernels import shadowkv
+from typing import List
+from .merge_configs import PaluConfig
+from torch.autograd.profiler import record_function
 
 class KV_Cache:
     """Full Attention"""
@@ -105,6 +108,318 @@ class KV_Cache:
 
     def get_kv_len(self):
         return self.kv_offset
+
+class xKVCache:
+    def __init__(self,
+        model_config :object,
+        merge_config: PaluConfig,
+        batch_size :int = 1,
+        max_length :int = 32*1024, 
+        device :str = 'cuda:0',
+        dtype = torch.bfloat16,
+    ) -> None:         
+        
+        ## TBD
+        self.config = model_config
+        self.merge_setup = merge_config
+        self.batch_size = batch_size
+        self.max_length = max_length
+        self.device = device
+        self.dtype = dtype
+        self.num_key_value_groups = model_config.num_attention_heads // model_config.num_key_value_heads
+        self.head_dim = model_config.hidden_size // model_config.num_attention_heads
+        self.num_attention_heads = model_config.num_attention_heads
+        self.num_key_value_heads = model_config.num_key_value_heads
+    
+        self.Ak: List[torch.Tensor] = []
+        self.Av: List[torch.Tensor] = []
+        
+        self.Bk: List[torch.Tensor] = []
+        self.Bv: List[torch.Tensor] = []
+        
+        self.k_prefill_buffer: List[torch.Tensor] = [] # for storing the full dimension key cache before mering
+        self.v_prefill_buffer: List[torch.Tensor] = [] # for storing the full dimension value cache before mering
+        
+        self.num_layers = model_config.num_hidden_layers
+        self.kv_offset = 0
+        self.prefill = 0
+        self.gen_offset = 0
+        self.prompt_len = 0 # Store the prompt length
+        
+        # batch prefill record
+        self.prefilled_batch = 0
+        self.batch_size = batch_size
+        
+        self.k_inference_buffer = torch.zeros(
+            batch_size,
+            model_config.num_key_value_heads,
+            max_length,
+            model_config.hidden_size // model_config.num_attention_heads,
+            device=self.device,
+            dtype=self.dtype
+        )
+        
+        self.v_inference_buffer = torch.zeros(
+            batch_size,
+            model_config.num_key_value_heads,
+            max_length,
+            model_config.hidden_size // model_config.num_attention_heads,
+            device=self.device,
+            dtype=self.dtype
+        )
+        
+        self.k_new_generated = torch.zeros(
+            self.num_layers,
+            batch_size,
+            model_config.num_key_value_heads,
+            512,
+            model_config.hidden_size // model_config.num_attention_heads,
+            device=self.device,
+            dtype=self.dtype
+        )
+        
+        self.v_new_generated = torch.zeros(
+            self.num_layers,
+            batch_size,
+            model_config.num_key_value_heads,
+            512,
+            model_config.hidden_size // model_config.num_attention_heads,
+            device=self.device,
+            dtype=self.dtype
+        )
+        
+        
+    def _should_merge(self, layer_idx):
+        """Check if this layer is the last in its merge group using dictionary lookup."""
+        group_info = self.merge_setup.get_group_for_layer(layer_idx)
+        if group_info is not None: # No group found
+            last_layer_idx_in_group = group_info.layers[-1]
+            return layer_idx == last_layer_idx_in_group
+        return False
+    
+    @torch.no_grad()
+    def prefill_kv_cache(self,
+            new_k_cache_pre_roped: torch.Tensor,
+            new_v_cache :torch.Tensor,
+            layer_idx :int,
+        ):
+        # check whether new_cache_pre_roped and new_v_cache is 4d
+        assert new_k_cache_pre_roped.dim() == 3, "new_k_cache_pre_roped should be 3d"
+        assert new_v_cache.dim() == 3, "new_v_cache should be 3d"
+        
+        # NOTE(brian1009): We assume that K, and V here are both of shape [bsz, incoming, num_kv_heads, head_dim]
+        
+        incoming = new_v_cache.shape[-2] # [bsz, incoming, num_kv_heads*head_dim] 
+        self.prefill = incoming
+
+
+        self.k_prefill_buffer.append(new_k_cache_pre_roped.detach().clone())
+        self.v_prefill_buffer.append(new_v_cache.detach().clone())
+        
+        # print the tensor size of the buffer
+        # NOTE(BRIAN1009): debugging
+        if self._should_merge(layer_idx):
+            self.cross_layer_svd(layer_idx)
+            # clean the buffer
+            self.k_prefill_buffer.clear()
+            self.v_prefill_buffer.clear()
+        if layer_idx == self.num_layers - 1:
+            self.kv_offset += incoming
+            if self.prompt_len == 0:  # Only set prompt_len once during initial prefill
+                self.prompt_len = self.kv_offset
+
+    
+    @torch.no_grad()
+    def cross_layer_svd(self, last_layer_idx):
+        with record_function("## Cross-layer SVD ##"):
+            """Perform fake SVD on grouped layers, inferring dimensions from the tensors."""
+            group_info = self.merge_setup.get_group_for_layer(last_layer_idx)
+            if group_info is None:
+                return  # No valid group found
+            start_layer_idx, end_layer_idx = group_info.layers[0], group_info.layers[-1]       
+            assert len(self.v_prefill_buffer) == len(group_info.layers)
+            # Step 2: Concatenate along the sequence length dimension
+            combined_key = torch.cat(self.k_prefill_buffer, dim=-1)  # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
+            combined_value = torch.cat(self.v_prefill_buffer, dim=-1) # Shape: (batch_size, seq_len, num_heads*head_dim*layer_group_size)
+
+            # Step 3: Apply fake SVD (truncate and multiply back)
+            Ak, Bk = self._svd(combined_key, rank=group_info.rank_k)
+            Av, Bv = self._svd(combined_value, rank=group_info.rank_v)
+            
+            split_sizes = [self.num_key_value_heads*self.head_dim for _ in range(start_layer_idx, end_layer_idx + 1)]
+            Bks = torch.split(Bk, split_sizes, dim=-1)
+            Bvs = torch.split(Bv, split_sizes, dim=-1)
+            
+            # Cache shared latents and layer-specific reconstruction matrices
+            self.Bk.extend(Bks)
+            self.Bv.extend(Bvs)
+            self.Ak.append(Ak)
+            self.Av.append(Av)
+
+        # torch.cuda.synchronize()
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        # torch.cuda.synchronize()
+    
+    def _svd(self, tensor, rank, randomized_svd=True):
+        original_dtype = tensor.dtype
+        if not randomized_svd:
+            U, S, V_h = torch.linalg.svd(tensor.float(), full_matrices=False)
+            U_trunc = U[:, :, :rank]
+            S_trunc = S[:, :rank]
+            V_h_trunc = V_h[:, :rank, :]
+            A = torch.matmul(U_trunc, torch.diag_embed(S_trunc)).to(original_dtype)
+            B = V_h_trunc.to(original_dtype)
+        else:
+            U, S, V = torch.svd_lowrank(tensor.float(), q=rank)
+            A = torch.matmul(U, torch.diag_embed(S)).to(original_dtype)
+            B = V.transpose(-2, -1).to(original_dtype)
+        
+        return A, B
+        
+    
+    def _get_basis_and_reconst_matrix(self, layer_idx, target='key'):
+        group_info = self.merge_setup.get_group_for_layer(layer_idx)
+        assert group_info is not None, "No valid group found"
+        group_id = group_info.group_id
+        if target == 'key':
+            return self.Ak[group_id], self.Bk[layer_idx]
+        elif target == 'value':
+            return self.Av[group_id], self.Bv[layer_idx]
+        else:
+            raise ValueError(f"Invalid target: {target}")
+    
+    @torch.no_grad()
+    def get_value_cache(self, layer_idx):
+        """
+        Reconstruct the entire value cache for `layer_idx` up to the current decode position
+        (self.gen_offset) by combining:
+        - The old (prefilled) tokens from A @ B (SVD factors).
+        - The newly generated tokens from self.v_new_generated.
+        We store them directly into self.v_inference_buffer (in two slices)
+        and return the relevant portion of that buffer.
+        """
+        with record_function("## Reconstruct Value Cache ##"):
+            # # # 1) Get A, B for the group that this layer belongs to
+            A, B = self._get_basis_and_reconst_matrix(layer_idx, target='value')
+            # A shape => (bs, old_seq_len, rank)
+            # B shape => (bs, rank, hidden_dim)
+            # We'll do an einsum or matmul to get (bs, old_seq_len, hidden_dim)
+            V_old = torch.einsum('bsr,brd->bsd', A, B)  # shape => (bs, old_seq_len, hidden_dim)
+
+        bs, old_seq_len, hidden_dim = V_old.shape
+        heads = self.num_key_value_heads
+        head_dim = hidden_dim // heads
+
+        # # 2) Reshape the old portion to (bs, old_seq_len, heads, head_dim)
+        V_old_t = V_old.view(bs, old_seq_len, heads, head_dim).transpose(1, 2)
+
+        #V_old_t = self.v_prefill_buffer[layer_idx]
+        bs, heads, old_seq_len, head_dim = V_old_t.shape
+
+        # # 3) Get the new portion from self.v_new_generated
+        # # shape => (bs, num_key_value_heads, gen_offset, head_dim)
+        gen_offset = self.gen_offset + 1 if layer_idx != self.num_layers - 1 else self.gen_offset
+        V_new = self.v_new_generated[layer_idx, :, :, :gen_offset, :]
+        new_seq_len = gen_offset
+
+        # (b) Copy old portion directly
+        self.v_inference_buffer[:, :, :old_seq_len, :].copy_(V_old_t)
+
+        # (c) Copy new portion
+        self.v_inference_buffer[:, :, old_seq_len : (old_seq_len + new_seq_len), :].copy_(V_new)
+
+        total_seq_len = old_seq_len + new_seq_len
+
+        # 5) Return the slice that covers the entire sequence so far
+        return self.v_inference_buffer[:, :, :total_seq_len, :]
+
+    @torch.no_grad()
+    def get_key_cache(self, layer_idx, position_ids, rope_func):
+        """
+        Similar approach, but we apply rotary embeddings only to the reconstructed portion.
+        The newly generated tokens already have RoPE applied.
+        """
+        ## 1) Get KV-Cache from buffer
+        with record_function("## Get Key Cache ##"):
+            A, B = self._get_basis_and_reconst_matrix(layer_idx, target='key')
+            K_old = torch.einsum('bsr,brd->bsd', A, B)
+            bs, old_seq_len, hidden_dim = K_old.shape
+            heads = self.num_key_value_heads
+        head_dim = hidden_dim // heads
+        K_old_t = K_old.view(bs, old_seq_len, heads, head_dim).transpose(1, 2)
+    
+        # 3) Apply RoPE to the reconstructed portion and permute to match buffer format
+        with record_function("## Re-RoPE Key ##"):
+            K_old_t = rope_func(K_old_t, position_ids)  # Apply RoPE here
+        
+        # 4) Grab newly generated portion (already has RoPE applied)
+        gen_offset = self.gen_offset + 1 if layer_idx != self.num_layers - 1 else self.gen_offset
+        K_new = self.k_new_generated[layer_idx, :, :, :gen_offset, :] # (bs, num_kv_heads, gen_offset, head_dim)
+        new_seq_len = gen_offset
+
+        # 5) We'll write both old and new into k_inference_buffer WITHOUT doing a cat.
+        #    Our k_inference_buffer is shaped (bs, heads, max_length, head_dim).
+        #    We want to store old portion in [0 : old_seq_len], new in [old_seq_len : old_seq_len + new_seq_len].
+
+        # (a) Copy old portion directly (already in the right format after RoPE and transpose)
+        self.k_inference_buffer[:, :, :old_seq_len, :].copy_(K_old_t)
+
+        # (b) Copy new portion (already has RoPE)
+        self.k_inference_buffer[:, :, old_seq_len : (old_seq_len + new_seq_len), :].copy_(K_new)
+
+        total_seq_len = old_seq_len + new_seq_len
+        # 6) Return final slice
+        return self.k_inference_buffer[:, :, :total_seq_len, :]
+
+    def update_kv_cache(self,
+            new_k_roped_cache :torch.Tensor,
+            new_v_cache :torch.Tensor,
+            layer_idx :int,
+        ):
+        # note that new_k_roped_cache and new_v_cache are 4d tensors
+        assert new_k_roped_cache.dim() == 4, "new_k_roped_cache should be 4d"
+        assert new_v_cache.dim() == 4, "new_v_cache should be 4d"
+        incoming = new_k_roped_cache.shape[-2]
+        assert incoming ==  1, "Only update 1 tokens at a time at xKVCache"
+        self.k_new_generated[layer_idx][:, :, self.gen_offset:self.gen_offset + incoming].copy_(new_k_roped_cache)
+        self.v_new_generated[layer_idx][:, :, self.gen_offset:self.gen_offset + incoming].copy_(new_v_cache)
+        
+        if layer_idx == self.num_layers - 1:
+            self.kv_offset += incoming
+            self.gen_offset += incoming
+        
+    
+    def clear(self):
+        self.kv_offset = 0
+        self.prefilled_batch = 0
+        self.prompt_len = 0  # Reset prompt length
+        self.gen_offset = 0
+        self.Ak = []
+        self.Av = []
+        self.Bk = []
+        self.Bv = []
+        self.k_prefill_buffer = []
+        self.v_prefill_buffer = []
+        self.k_new_generated.zero_()
+        self.v_new_generated.zero_()
+        self.k_inference_buffer.zero_()
+        self.v_inference_buffer.zero_()
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    def H2D(self):
+        pass
+
+    def get_kv_len(self):
+        return self.kv_offset
+
+    def get_prompt_len(self):
+        return self.prompt_len
+
+    def print_stats(self):
+        print(f"xKVCache | prompt_len: {self.prompt_len} | current_len: {self.kv_offset}")
 
 class ShadowKVCache:
     """ShadowKV, only for accuracy measurement and understanding, not for efficiency, please refer to ShadowKV_CPU for the efficient implementation"""

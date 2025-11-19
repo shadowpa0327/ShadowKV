@@ -67,7 +67,7 @@ def parse_args() -> Namespace:
     def str_to_list(arg):
         return arg.split(',')
     p = ArgumentParser()
-    p.add_argument("--model_name", type=str, default="gradientai/Llama-3-8B-Instruct-Gradient-1048k")
+    p.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct")
     p.add_argument("--dataset_name", type=str_to_list, default=["ruler/niah_single_1"])
     p.add_argument("--num_samples", type=int, default=-1)
     p.add_argument("--batch_size", type=int, default=1)
@@ -104,7 +104,7 @@ if __name__ == '__main__':
     
     if dist_config.master_process:
         print(colored(f"data_names: {dataset_names}", 'cyan'))
-    
+
     LLM = choose_model_class(model_name)
 
     llm = LLM(model_name=model_name, batch_size=batch_size, device=dist_config.device, max_length=datalen+2048, attn_mode=args.method, dtype=dtype, sparse_budget=sparse_budget, rank=rank, chunk_size=chunk_size, minference=minference)

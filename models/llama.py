@@ -28,9 +28,16 @@ transformers.logging.set_verbosity_error()
 import vllm
 from minference.configs.model2path import MODEL2PATH
 
-from .tensor_op import layer_norm, apply_rotary_pos_emb, apply_rotary_pos_emb_single, apply_rotary_pos_emb_cuda
+from .tensor_op import (
+    layer_norm, 
+    apply_rotary_pos_emb, 
+    apply_rotary_pos_emb_single, 
+    apply_rotary_pos_emb_cuda, 
+    apply_rotary_pos_emb_cuda_chunked
+)
 from .prompt_template import Templates, Chat_Templates, Prefix_Templates
 from .base import LLM
+from .merge_configs import generate_consecutive_palu_config
 
 class LlamaLayer:
     def __init__(self, layer_idx) -> None:
@@ -82,10 +89,19 @@ class Llama(LLM):
         device :str = 'cuda:0',
         dtype = torch.bfloat16,
         attn_mode: str = 'full',
+        # for ShadowKV
         sparse_budget: int = 2048,
         rank=160,
         chunk_size=8,
-        minference=False) -> None:
+        # for minference
+        minference=False,
+        # for xKV
+        start_layer_idx=0,
+        end_layer_idx=-1,
+        group_size=2,
+        rank_k=256,
+        rank_v=384,
+    ) -> None:
         
         # assert batch_size == 1, "Batch size must be 1"
         self.batch_size = batch_size
@@ -107,7 +123,15 @@ class Llama(LLM):
         self.init_parameters()
         self.attn_mode = attn_mode
         self.minference = minference
-
+        
+        self.merge_config = generate_consecutive_palu_config(
+            start_layer=start_layer_idx,
+            end_layer=end_layer_idx if end_layer_idx != -1 else self.num_layers,
+            group_size=group_size,
+            rank_k=rank_k,
+            rank_v=rank_v
+        )
+        
         if 'llama-3' in model_name.lower():
             self.ctx_template = Templates['llama-3']
             self.chat_template = Chat_Templates['llama-3']
@@ -119,7 +143,7 @@ class Llama(LLM):
         else:
             raise ValueError(f"Invalid model name {model_name}")
 
-        self.init_kv_cache(sparse_budget, rank, chunk_size, self.config)
+        self.init_kv_cache(sparse_budget, rank, chunk_size, self.config, self.merge_config)
 
         if self.minference:
             import json
@@ -136,7 +160,11 @@ class Llama(LLM):
 
     @torch.inference_mode()
     def apply_rotary_pos_emb_single(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        return apply_rotary_pos_emb_cuda(x, self.cos_sin_cache, position_ids)
+        return apply_rotary_pos_emb_cuda_chunked(x, self.cos_sin_cache, position_ids)
+
+    @torch.inference_mode()
+    def apply_rotary_pos_emb_single_torch(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        return apply_rotary_pos_emb_single(x, self.cos_cache, self.sin_cache, position_ids)
 
     @torch.inference_mode()
     def apply_rotary_pos_emb(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
@@ -158,7 +186,7 @@ class Llama(LLM):
         except:
             cos_cache, sin_cache = self._set_cos_sin_cache(hf_model.model.layers[0].self_attn.rotary_emb.inv_freq.to(self.device))
         self.cos_sin_cache = torch.cat((cos_cache[:, :64], sin_cache[:, :64]), dim=-1)
-        
+        self.cos_cache, self.sin_cache = cos_cache, sin_cache
         del cos_cache, sin_cache
 
         self.layers :list[LlamaLayer] = []
@@ -173,6 +201,7 @@ class Llama(LLM):
 
         self.num_layers = len(self.layers)
 
+    @torch.inference_mode()
     def pre_attention_compute(
         self,
         hidden_states: torch.Tensor,
@@ -184,9 +213,9 @@ class Llama(LLM):
         hidden_states = layer_norm(hidden_states, buffer.input_layernorm_variance_epsilon, buffer.input_layernorm_weight)
         qkv = F.linear(hidden_states, buffer.wqkv)
         query_states, key_states, value_states = qkv.split([buffer.q_size, buffer.kv_size, buffer.kv_size], dim=-1)
-
         return query_states, key_states, value_states.view(value_states.shape[0], -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+    @torch.inference_mode()
     def post_attention_compute(
         self,
         attn_output: torch.Tensor,

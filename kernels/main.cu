@@ -28,6 +28,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gather_copy_with_offsets", &gather_copy_with_offsets, "Gather-Copy with offsets (CUDA)");
     m.def("apply_rotary_pos_emb", &apply_rotary_pos_emb, "Apply rotary position embedding (CUDA)");
     m.def("apply_rotary_pos_emb_new", &apply_rotary_pos_emb_new, "Apply rotary positional embeddings (CUDA)");
+    m.def("apply_rotary_pos_emb_chunked", &apply_rotary_pos_emb_chunked, "Apply rotary positional embeddings (CUDA)");
     m.def("apply_rotary_pos_emb_new_v2", &apply_rotary_pos_emb_new_v2, "Apply rotary positional embeddings version 2 (CUDA)");
     m.def("apply_rotary_pos_emb_push_cache", &apply_rotary_pos_emb_push_cache, "Apply rotary positional embeddings with cache pushing (CUDA)");
     m.def("apply_rotary_pos_emb_push_cache_opt", &apply_rotary_pos_emb_push_cache_opt, "Apply rotary positional embeddings with cache pushing (CUDA)");
